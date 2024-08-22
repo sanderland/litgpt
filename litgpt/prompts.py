@@ -208,7 +208,7 @@ class Llama3(PromptStyle):
         # https://github.com/meta-llama/llama3/blob/359887376f0aaf30e433f23e25df858d8c2a9833/llama/tokenizer.py#L202-L229
         if isinstance(prompt, str):
             return (
-                "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\n"
+                "<|start_header_id|>system<|end_header_id|>\n\n" # <|begin_of_text|>
                 f"{default_system_prompt}<|eot_id|>" # No newline
                 "<|start_header_id|>user<|end_header_id|>\n\n"
                 f"{prompt}<|eot_id|>" # No newline
@@ -229,7 +229,7 @@ class Llama3(PromptStyle):
             def has_system_prompt(messages: List[Dict[str, str]]) -> bool:
                 return messages[0].get("role", "") == "system" if len(messages) else False
 
-            tokens = ["<|begin_of_text|>"]
+            tokens = [] # "<|begin_of_text|>"
             if not has_system_prompt(prompt):
                 tokens.extend(encode_message({"role": "system", "content": default_system_prompt}))
             for i, message in enumerate(prompt):

@@ -129,10 +129,13 @@ class Tokenizer:
             tokens = tokens[:max_length]
         return torch.tensor(tokens, dtype=torch.int, device=device)
 
-    def decode(self, tensor: torch.Tensor) -> str:
+    def decode(self, tensor: torch.Tensor, skip_special_tokens=False) -> str:
         tokens = [tensor.item()] if tensor.ndim == 0 else tensor.tolist()
         if len(tokens) == 1 and self.apply_decoding_fix:
             dummy_token_id = 33  # \x1e
             dummy_token = self.processor.decode([dummy_token_id])
             return self.processor.decode([dummy_token_id] + tokens)[len(dummy_token) :]
-        return self.processor.decode(tokens)
+        if self.backend == "huggingface":
+            return self.processor.decode(tokens, skip_special_tokens=skip_special_tokens)
+        elif self.backend == "sentencepiece":   
+            return self.processor.decode(tokens) # TODO: how to support skip_special_tokens?

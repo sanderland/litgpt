@@ -6,18 +6,18 @@ import time
 from pathlib import Path
 from pprint import pprint
 from typing import Dict, List, Literal, Optional, Tuple, Union
-
 import lightning as L
 import torch
 from lightning.fabric.strategies import FSDPStrategy
 from torch.utils.data import DataLoader, ConcatDataset
 from torchmetrics import RunningMean
+from dataclasses import asdict
 
 from litgpt.args import EvalArgs, TrainArgs
 from litgpt.data import Alpaca, DataModule
 from litgpt.generate.base import generate
 from litgpt.model import GPT, Block, Config
-from litgpt.prompts import save_prompt_style
+from litgpt.prompts import save_prompt_style, PromptStyle
 from litgpt.tokenizer import Tokenizer
 from litgpt.utils import (
     auto_download_checkpoint,
@@ -36,6 +36,18 @@ from litgpt.utils import (
     parse_devices,
     save_hyperparameters,
 )
+
+def serialize_settings(settings):
+    if dataclasses.is_dataclass(settings):
+        settings = asdict(settings)
+    if isinstance(settings, dict):
+        return {k: serialize_settings(v) for k, v in settings.items()}
+    elif isinstance(settings, (Path,PromptStyle)):
+        return str(settings)
+    elif isinstance(settings, (int, float, bool, type(None))):
+        return settings
+    else: # not sure we can handle it, avoid crashes by converting to string
+        return str(settings) 
 
 
 def setup(
@@ -82,7 +94,8 @@ def setup(
         access_token: Optional API token to access models with restrictions.
     """
     checkpoint_dir = auto_download_checkpoint(model_name=checkpoint_dir, access_token=access_token)
-    pprint(locals())
+    all_settings = locals()
+    pprint(all_settings)
     data = Alpaca() if data is None else data
     devices = parse_devices(devices)
     out_dir = init_out_dir(out_dir)
@@ -92,8 +105,9 @@ def setup(
 
     precision = precision or get_default_supported_precision(training=True)
     logger = choose_logger(
-        logger_name, out_dir, name=f"finetune-{config.name}", resume=bool(resume), log_interval=train.log_interval
+        logger_name, out_dir, name=f"sander-finetune-{config.name}", run_name = train.run_name, resume=bool(resume), log_interval=train.log_interval, config=serialize_settings(all_settings)
     )
+
 
     if devices * num_nodes > 1:
         strategy = FSDPStrategy(
@@ -153,6 +167,7 @@ def main(
 
     model = fabric.setup(model)
 
+    fabric.print(f"Creating optimizer {optimizer!r}")
     optimizer = instantiate_torch_optimizer(optimizer, model.parameters())
     optimizer = fabric.setup_optimizers(optimizer)
     scheduler = get_lr_scheduler(optimizer, warmup_steps=train.lr_warmup_steps, max_steps=lr_max_steps)
@@ -243,11 +258,21 @@ def fit(
     )
     fabric.barrier()
 
+    steps_per_epoch = len(train_dataloader) // train.gradient_accumulation_iters(devices)
+    fabric.print(f"Training for {train.epochs} epochs with {steps_per_epoch} each or {max_steps} steps.\nGradient accumulation steps: {train.gradient_accumulation_iters(devices)} from global batch size = {train.global_batch_size} -> {train.batch_size(devices)} per device ({devices}) and micro batch size {train.micro_batch_size}")
+
     while state["step_count"] < max_steps and train_iterator.epoch < train.epochs:
         state["iter_num"] += 1
         iter_t0 = time.perf_counter()
         batch = next(train_iterator)
         input_ids, targets = batch["input_ids"], batch["labels"]
+
+        # if rank 0
+        if fabric.global_rank == 0 and state["iter_num"] == 10: # not step 1 since w&b might not be init
+            non_pad_ids = input_ids[0][input_ids[0] != 0] # assume pad token id is 0
+            fabric.print(f"First row of input ids with total shape {input_ids.shape}: {non_pad_ids}")
+            fabric.print(f"Detokenized: {tokenizer.decode(non_pad_ids, skip_special_tokens=False)}")
+            #generate_example(fabric, model, tokenizer, eval, data)
 
         is_accumulating = state["iter_num"] % train.gradient_accumulation_iters(devices) != 0
         with fabric.no_backward_sync(model, enabled=is_accumulating):
@@ -259,6 +284,8 @@ def fit(
         running_loss.update(loss.detach())
 
         if not is_accumulating:
+            if train.max_norm is not None:
+                fabric.clip_gradients(model, optimizer, max_norm=train.max_norm)
             optimizer.step()
             optimizer.zero_grad()
             scheduler.step()
@@ -282,10 +309,11 @@ def fit(
             if isinstance(val_loss, torch.Tensor):
                 val_loss = f"{val_loss:.3f}"
             fabric.print(
-                f"Epoch {metrics['epoch']+1} | iter {metrics['iter']} step {metrics['step']} |"
+                f"Epoch {metrics['epoch']+1} | iter {metrics['iter']} step {metrics['step']} / {steps_per_epoch} |"
                 f" loss train: {metrics['loss']:.3f},"
                 f" val: {val_loss} |"
-                f" iter time: {metrics['iter_time'] * 1000:.2f} ms"
+                f" iter time: {metrics['iter_time'] * 1000:.2f} ms |"
+                f" lr: {metrics['learning_rate']:.2e}"
                 f"{' (step)' if not is_accumulating else ''}"
             )
             fabric.log_dict(metrics, step=state["iter_num"])
@@ -332,9 +360,13 @@ def validate(fabric: L.Fabric, model: GPT, val_dataloader: DataLoader, eval: Eva
 @torch.no_grad()
 def generate_example(fabric: L.Fabric, model: GPT, tokenizer: Tokenizer, eval: EvalArgs, data: DataModule):
     instruction = "Recommend a movie for me to watch during the weekend and explain the reason."
-    fabric.print(instruction)
+    instruction = "What is 1+1. Only give the answer. Do not elaborate."
     prompt = data.prompt_style.apply(instruction)
+    #prompt = prompt.replace("<|eot_id|>", "<|eot_id|>\n")
     encoded = tokenizer.encode(prompt, device=fabric.device)
+    token_decoded = [tokenizer.decode(torch.tensor([t])) for t in encoded]
+    fabric.print(f"Generating example for prompt up to EOS = {tokenizer.eos_id} or {eval.max_new_tokens} tokens:\n{prompt}\nTokens: {encoded}\nTokens strings: {token_decoded}")
+
     model.eval()
 
     with fabric.init_tensor():
@@ -348,12 +380,13 @@ def generate_example(fabric: L.Fabric, model: GPT, tokenizer: Tokenizer, eval: E
             # do not set `max_seq_length=max_returned_token` because memory is not a concern here
             model.set_kv_cache(batch_size=1)
         output = generate(
-            model, encoded, max_returned_tokens=max_returned_tokens, temperature=0.8, eos_id=tokenizer.eos_id
+            model, encoded, max_returned_tokens=max_returned_tokens, temperature=0.8, eos_id=tokenizer.eos_id, include_prompt=False
         )
         model.clear_kv_cache()
         model.train()
-        output = tokenizer.decode(output)
-        fabric.print(output)
+        output_text = tokenizer.decode(output, skip_special_tokens=False)
+        token_decoded = [tokenizer.decode(torch.tensor([t])) for t in output]
+        fabric.print(f"Completion:\n{output_text}\nTokens: {output}\nTokens strings: {token_decoded}")
     else:
         print(
             f"Length of encoded instruction ({len(encoded)}) and eval.max_new_tokens ({eval.max_new_tokens}) "
@@ -392,7 +425,7 @@ def get_longest_seq_length(data: List[Dict]) -> Tuple[int, int]:
 
 def validate_args(train: TrainArgs, eval: EvalArgs) -> None:
     issues = []
-    unsupported = [(train, ["max_tokens", "max_norm", "tie_embeddings", "lr_warmup_fraction"])]
+    unsupported = [(train, ["max_tokens", "tie_embeddings", "lr_warmup_fraction"])]
     for args, names in unsupported:
         for name in names:
             if getattr(args, name) is not None:

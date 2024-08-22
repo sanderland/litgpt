@@ -8,6 +8,7 @@ import pickle
 import re
 import shutil
 import sys
+from datetime import datetime
 from dataclasses import asdict, is_dataclass
 from io import BytesIO
 from packaging import version
@@ -516,6 +517,7 @@ def choose_logger(
     logger_name: Literal["csv", "tensorboard", "wandb"],
     out_dir: Path,
     name: str,
+    run_name: Optional[str] = None,
     log_interval: int = 1,
     resume: Optional[bool] = None,
     **kwargs: Any,
@@ -525,7 +527,12 @@ def choose_logger(
     if logger_name == "tensorboard":
         return TensorBoardLogger(root_dir=(out_dir / "logs"), name="tensorboard", **kwargs)
     if logger_name == "wandb":
-        return WandbLogger(project=name, resume=resume, **kwargs)
+        # add "{model}_{datetime}" \
+        if run_name is None:
+            run_name = "{model}_{datetime}"
+        run_name = run_name.format(model=name, datetime=datetime.now().strftime("%Y%m%d_%H:%M"))
+        print(f"🪄🐝 Logging to Weights & Biases: {name}/{run_name}")
+        return WandbLogger(project=name, name=run_name, resume=resume, **kwargs)
     raise ValueError(f"`--logger_name={logger_name}` is not a valid option. Choose from 'csv', 'tensorboard', 'wandb'.")
 
 
@@ -555,6 +562,8 @@ def instantiate_torch_optimizer(optimizer, model_parameters, **kwargs):
         optimizer = optimizer_cls(model_parameters, **kwargs)
     else:
         optimizer = dict(optimizer)  # copy
+        if "init_args" not in optimizer:
+            optimizer["init_args"] = {}
         optimizer["init_args"].update(kwargs)
         optimizer = instantiate_class(model_parameters, optimizer)
     return optimizer
@@ -628,9 +637,7 @@ def check_nvlink_connectivity(fabric=None):
             gpu_regex = re.compile(r'^GPU\d+$')
             gpu_count = len([header for header in headers if gpu_regex.match(header)])
 
-            for line in lines[start_index:]:
-                if not line.strip():
-                    break
+            for line in lines[start_index:start_index + gpu_count]:
                 gpu_matrix.append(line.strip())
 
             all_nvlink = True
@@ -651,5 +658,3 @@ def check_nvlink_connectivity(fabric=None):
         except Exception as e:
             custom_print(f"An error occurred: {e}")
 
-        except Exception as e:
-            custom_print(f"An error occurred: {e}")

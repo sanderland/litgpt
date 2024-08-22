@@ -37,6 +37,9 @@ class TrainArgs:
     max_norm: Optional[float] = None
     min_lr: float = 6e-5
 
+    # logging args, these probably should be moved somewhere else?
+    run_name: Optional[str] = None # w&b run name
+
     def __post_init__(self) -> None:
         if self.lr_warmup_fraction and self.lr_warmup_steps:
             raise ValueError(
